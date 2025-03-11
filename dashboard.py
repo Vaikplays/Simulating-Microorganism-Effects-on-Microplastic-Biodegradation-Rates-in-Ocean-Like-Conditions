@@ -14,13 +14,14 @@ This dashboard performs the following tasks:
 6. Determines which microorganism is predicted to be best at the user-specified day.
 """
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-import logging
-import warnings
+import streamlit as st          # For building interactive web dashboards
+import pandas as pd             # For data manipulation and CSV file reading
+import numpy as np              # For numerical operations and array handling
+import plotly.express as px     # For creating interactive plots
+import logging                  # For logging messages (e.g., debugging/info)
+import warnings                 # To manage/suppress warnings
 
+# Import functions for curve fitting, interpolation, and regression models
 from scipy.optimize import curve_fit, OptimizeWarning
 from scipy.interpolate import PchipInterpolator
 from sklearn.preprocessing import PolynomialFeatures
@@ -31,7 +32,7 @@ from sklearn.isotonic import IsotonicRegression
 # 1) LOGGING
 ###############################################################################
 def setup_logging():
-    """Configure logging to show messages with timestamps."""
+    """Configure logging to show messages with timestamps and log levels."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s"
@@ -43,43 +44,59 @@ def setup_logging():
 def load_and_clean(csv_path="experimental_data.csv"):
     """
     Loads data from a CSV file and cleans it.
-
-    Required columns:
-      - plastic_type, microorganism, degradation_rate, days, temperature, pH
-
-    Steps:
-      - Drop rows missing these columns.
-      - Strip non-digit characters from numeric fields.
-      - Convert to numeric and drop remaining NaNs.
-      - Filter for days >= 0 and degradation in [0, 100].
-      - Strip whitespace from text fields.
+    
+    Expected columns:
+      - plastic_type: Type of plastic used in the experiment.
+      - microorganism: Name (genus/species) of the microorganism.
+      - degradation_rate: Percentage of biodegradation (0 to 100).
+      - days: Time in days over which degradation is measured.
+      - temperature: Temperature (°C) at which the experiment was conducted.
+      - pH: pH value of the environment.
+    
+    Processing steps:
+      - Read the CSV file.
+      - Drop rows missing any of the required columns.
+      - For numeric columns ("days", "degradation_rate", "temperature", "pH"):
+          • Remove any non-numeric characters.
+          • Convert to numeric type.
+      - Drop any rows where conversion results in NaN.
+      - Filter rows to ensure:
+          • Days are non-negative.
+          • Degradation is between 0 and 100.
+      - Strip extra whitespace from text columns.
     """
     df = pd.read_csv(csv_path)
     needed = ["plastic_type", "microorganism", "degradation_rate", "days", "temperature", "pH"]
     df.dropna(subset=needed, inplace=True)
 
+    # Clean each numeric column
     for col in ["days", "degradation_rate", "temperature", "pH"]:
         df[col] = df[col].astype(str).str.replace(r"[^\d.]+", "", regex=True)
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Drop any rows with NaNs after conversion and filter valid ranges
     df.dropna(subset=["days", "degradation_rate", "temperature", "pH"], inplace=True)
     df = df[(df["days"] >= 0) & (df["degradation_rate"].between(0, 100))]
 
+    # Trim extra whitespace from plastic_type and microorganism columns
     df["plastic_type"] = df["plastic_type"].astype(str).str.strip()
     df["microorganism"] = df["microorganism"].astype(str).str.strip()
     return df
 
 ###############################################################################
-# 3) GATHER VALID PLASTICS & MICROS
+# 3) GATHER VALID PLASTICS & MICROORGANISMS
 ###############################################################################
 def gather_plastics_with_valid_micros(df, threshold=2):
     """
-    Returns a list of plastics that have at least one microorganism
-    with >= threshold data points. Sorted by descending average degrade.
+    Returns a list of plastics that have at least one microorganism with
+    a minimum number of data points (threshold). The list is sorted by
+    descending average degradation.
     """
+    # Group by plastic_type and count occurrences
     grp = df.groupby("plastic_type").size().reset_index(name="count")
     grp = grp[grp["count"] >= threshold].copy()
     valid_list = []
+    # Loop over each plastic to check if it has any microorganism meeting the threshold
     for _, row in grp.iterrows():
         plastic = row["plastic_type"]
         sub = df[df["plastic_type"] == plastic]
@@ -89,22 +106,24 @@ def gather_plastics_with_valid_micros(df, threshold=2):
             valid_list.append(plastic)
     if not valid_list:
         return []
+    # Compute average degradation for each valid plastic
     df_avg = (
         df[df["plastic_type"].isin(valid_list)]
         .groupby("plastic_type")["degradation_rate"]
         .mean()
         .reset_index(name="avg_deg")
     )
+    # Sort plastics by average degradation descending
     df_avg.sort_values("avg_deg", ascending=False, inplace=True)
     return df_avg["plastic_type"].tolist()
 
 def gather_micros_options(df, plastic, threshold=2):
     """
-    For a given plastic, return multiple sorting options for microorganisms:
-      - Best Biodegradation (Highest avg)
-      - Most Data Points
-      - Alphabetical
-      - Worst Biodegradation (Lowest avg)
+    For a given plastic, returns a dictionary with different sorting options for microorganisms:
+      - "Best Biodegradation (Highest avg)": Microorganisms sorted by highest average degradation.
+      - "Most Data Points": Sorted by the number of data points.
+      - "Alphabetical": Sorted by microorganism name.
+      - "Worst Biodegradation (Lowest avg)": Sorted by lowest average degradation.
     """
     sub = df[df["plastic_type"] == plastic]
     grp = sub.groupby("microorganism").agg(
@@ -121,12 +140,13 @@ def gather_micros_options(df, plastic, threshold=2):
     return options
 
 ###############################################################################
-# 4) FORCE (0,0) & SATURATE AT 100
+# 4) FORCE ZERO START & SATURATE AT 100%
 ###############################################################################
 def force_zero_start(subset):
     """
-    If earliest day > 0, insert an extra row at day=0, degrade=0.
-    Ensures the curve starts from zero degrade at day=0.
+    Ensures that the degradation curve starts at (0, 0).
+    If the earliest day is greater than 0, a new row with day=0 and degradation=0
+    is added, carrying over temperature and pH from the first row.
     """
     if subset.empty:
         return subset
@@ -145,7 +165,9 @@ def force_zero_start(subset):
 
 def force_saturate_100(x_data, y_data, offset=200.0):
     """
-    If final degrade < 100, append a new point at (last_day + offset, 100%).
+    Ensures the degradation curve eventually reaches 100%.
+    If the last degradation value is less than 100, a new data point is appended
+    with day = last_day + offset and degradation = 100%.
     """
     if y_data[-1] < 100:
         big_day = x_data[-1] + offset
@@ -154,12 +176,12 @@ def force_saturate_100(x_data, y_data, offset=200.0):
     return x_data, y_data
 
 ###############################################################################
-# 5) DIRECT LINE (2 POINTS)
+# 5) DIRECT LINE MODEL (FOR EXACTLY 2 DATA POINTS)
 ###############################################################################
 def fit_two_points(subset):
     """
-    If exactly 2 data points => direct line through them.
-    Negative slope allowed if data shows it.
+    For exactly 2 data points, fits a straight line between them.
+    Negative slopes are allowed if the data indicates.
     """
     if len(subset) != 2:
         return None, "Not exactly 2 points"
@@ -177,16 +199,22 @@ def fit_two_points(subset):
     return predict_line, None
 
 ###############################################################################
-# 6) WEIBULL MODEL
+# 6) WEIBULL MODEL FITTING
 ###############################################################################
 def weibull_model(t, lambd, kappa):
-    """Weibull function for biodegradation: y = 100*(1 - e^-((t/lambd)^kappa))."""
+    """
+    Weibull kinetic model for biodegradation:
+    y = 100*(1 - exp(- (t/lambd)^kappa ))
+    """
     return 100.0 * (1 - np.exp(-(t/lambd)**kappa))
 
 def fit_weibull(subset):
     """
-    Fit the Weibull model to data.
-    Pre-process => force start at 0, saturate at 100 => curve_fit => handle errors.
+    Fits the Weibull model to the degradation data.
+    Pre-processing:
+      - Forces the curve to start at 0 (if necessary).
+      - Forces saturation at 100% (if needed).
+    Uses curve_fit to determine the parameters lambd and kappa.
     """
     from scipy.optimize import curve_fit
     sub_s = subset.sort_values("days")
@@ -211,11 +239,12 @@ def fit_weibull(subset):
         return None, 0, f"Weibull error: {str(e)}"
 
 ###############################################################################
-# 7) LOG-TRANSFORM POLY
+# 7) LOG-TRANSFORM POLYNOMIAL MODEL
 ###############################################################################
 def fit_logtransform_poly(subset):
     """
-    Fit a polynomial in log(1+t). Usually gives a smooth curve for biodegradation.
+    Fits a polynomial model to the data after applying a log(1+t) transformation to time.
+    This transformation often produces a smoother degradation curve.
     """
     from sklearn.preprocessing import PolynomialFeatures
     from sklearn.linear_model import LinearRegression
@@ -230,13 +259,11 @@ def fit_logtransform_poly(subset):
         y_data = np.insert(y_data, 0, 0)
     if y_data[-1] < 100:
         x_data, y_data = force_saturate_100(x_data, y_data, offset=100)
-
-    X_log = np.log1p(x_data)
+    X_log = np.log1p(x_data)  # Apply log(1+t) transformation
     poly = PolynomialFeatures(degree=3)
     X_poly = poly.fit_transform(X_log.reshape(-1, 1))
     linreg = LinearRegression()
     linreg.fit(X_poly, y_data)
-
     def predict_logpoly(t):
         t_arr = np.clip(np.array(t), 0, None)
         t_log = np.log1p(t_arr)
@@ -246,12 +273,12 @@ def fit_logtransform_poly(subset):
     return predict_logpoly, -5, None
 
 ###############################################################################
-# 8) PCHIP & ISOTONIC
+# 8) PCHIP & ISOTONIC MODELS
 ###############################################################################
 def fit_pchip(subset, saturate_100=False):
     """
-    Fit a Piecewise Cubic Hermite Interpolating Polynomial (PCHIP).
-    Optionally saturate at 100% if degrade < 100 at the end.
+    Fits a Piecewise Cubic Hermite Interpolating Polynomial (PCHIP) to the data.
+    Optionally forces saturation at 100% if the final degradation is less than 100%.
     """
     from scipy.interpolate import PchipInterpolator
     if len(subset) < 2:
@@ -270,8 +297,8 @@ def fit_pchip(subset, saturate_100=False):
 
 def fit_isotonic(subset, saturate_100=True):
     """
-    Fit an isotonic regression to ensure a non-decreasing curve.
-    Optionally saturate at 100% if degrade < 100.
+    Fits an isotonic regression to the data to produce a non-decreasing curve.
+    Optionally forces the curve to reach 100% at the end.
     """
     if len(subset) < 2:
         return None, "Not enough data"
@@ -291,11 +318,14 @@ def fit_isotonic(subset, saturate_100=True):
     return predict_iso, None
 
 ###############################################################################
-# 9) CHECK CURVE & REPEATED X
+# 9) CHECK CURVE QUALITY & REPEATED X VALUES
 ###############################################################################
 def check_curve_quality(t_range, degrade_range, max_jump=30.0):
     """
-    Ensure the curve does not have negative slopes or large jumps > max_jump.
+    Checks the fitted curve to ensure that:
+      - There are no negative slopes.
+      - There are no sudden jumps exceeding max_jump.
+    Returns True if the curve quality is acceptable.
     """
     for i in range(len(degrade_range)-1):
         jump = degrade_range[i+1] - degrade_range[i]
@@ -305,7 +335,8 @@ def check_curve_quality(t_range, degrade_range, max_jump=30.0):
 
 def repeated_x_values(subset):
     """
-    Check if there are repeated 'days' in the subset.
+    Checks whether there are repeated 'days' values in the subset.
+    Returns True if any day appears more than once.
     """
     if len(subset) < 3:
         return False
@@ -313,15 +344,19 @@ def repeated_x_values(subset):
     return any(counts > 1)
 
 ###############################################################################
-# 10) FALLBACK CHAIN
+# 10) FALLBACK CHAIN (MODEL SELECTION)
 ###############################################################################
 def fit_auto_model(subset, user_day):
     """
-    Model selection fallback chain:
-      1) <2 => error
-      2) =2 => direct line
-      3) repeated x => isotonic
-      4) else => Weibull -> Log-Transform -> PCHIP -> Isotonic
+    Automatically selects the best fitting model using a fallback chain:
+      1. If <2 data points: return error.
+      2. If exactly 2 data points: fit a direct line.
+      3. If repeated x-values: use isotonic regression.
+      4. Otherwise, try in order:
+         - Weibull model
+         - Log-transform polynomial model
+         - PCHIP interpolation
+         - Isotonic regression (as final fallback)
     """
     subset = force_zero_start(subset)
     if len(subset) < 2:
@@ -337,7 +372,7 @@ def fit_auto_model(subset, user_day):
             return None, 0, "none", f"Isotonic error: {iso_err}"
         return iso_func, -3, "isotonic", None
 
-    # Try Weibull
+    # Attempt Weibull model fitting
     w_func, w_param, w_err = fit_weibull(subset)
     if not w_err:
         sub_s = subset.sort_values("days")
@@ -348,8 +383,8 @@ def fit_auto_model(subset, user_day):
         if check_curve_quality(t_range, degrade_range, 30.0):
             return w_func, w_param, "weibull", None
         w_err = "Weibull shape is weird"
-
-    # Log-Transform poly
+    
+    # Fallback: Log-transform polynomial model
     logpoly_func, param_l, err_l = fit_logtransform_poly(subset)
     if not err_l:
         sub_s = subset.sort_values("days")
@@ -360,15 +395,16 @@ def fit_auto_model(subset, user_day):
         if check_curve_quality(t_range, degrade_range, 30.0):
             return logpoly_func, param_l, "log_transform_poly", None
         err_l = "Log-transform poly shape is weird"
-
-    # PCHIP
+    
+    # Fallback: PCHIP interpolation
     pchip_func, pchip_err = fit_pchip(subset, saturate_100=False)
     if not pchip_err:
         sub_s = subset.sort_values("days")
         max_day_in_data = sub_s["days"].max()
         max_day = max(max_day_in_data, user_day, 60)
-        degrade_range = pchip_func(np.linspace(0, max_day, 100))
-        if check_curve_quality(np.linspace(0, max_day, 100), degrade_range, 30.0):
+        t_range = np.linspace(0, max_day, 100)
+        degrade_range = pchip_func(t_range)
+        if check_curve_quality(t_range, degrade_range, 30.0):
             return pchip_func, -2, "pchip", None
         else:
             iso_func, iso_err = fit_isotonic(subset, True)
@@ -382,16 +418,17 @@ def fit_auto_model(subset, user_day):
         return iso_func, -3, "isotonic", None
 
 ###############################################################################
-# 11) LOG-FIT
+# 11) LOG-FIT TO FALLBACK CURVE
 ###############################################################################
 def log_equation(t, a, b, c):
-    """Log eq: y = a + b*ln(1 + c*t)."""
+    """Logarithmic equation: y = a + b * ln(1 + c*t)."""
     return a + b * np.log(1 + c * t)
 
 def fit_log_to_fallback(fallback_func, max_day):
     """
-    Fit a log eq y = a + b ln(1 + c t) to the fallback curve.
-    Returns the log function or an error if fitting fails.
+    Fits a logarithmic model to the fallback curve using the equation:
+      y = a + b * ln(1 + c*t)
+    Returns a function that predicts values using this model.
     """
     from scipy.optimize import curve_fit
     t_sample = np.linspace(0, max_day, 100)
@@ -414,14 +451,15 @@ def fit_log_to_fallback(fallback_func, max_day):
         return None, f"Log eq error: {e}"
 
 ###############################################################################
-# NEW: MODEL EVALUATION METRICS
+# 12) MODEL EVALUATION METRICS
 ###############################################################################
 def compute_metrics(actual, predicted):
     """
-    Compute RMSE, R², and MAE between arrays of actual and predicted values.
-      - RMSE: Root Mean Squared Error
-      - R²: Coefficient of Determination
-      - MAE: Mean Absolute Error
+    Compute evaluation metrics between actual and predicted degradation values.
+    Returns:
+      - RMSE: Root Mean Squared Error.
+      - R²: Coefficient of Determination.
+      - MAE: Mean Absolute Error.
     """
     actual = np.array(actual)
     predicted = np.array(predicted)
@@ -436,7 +474,7 @@ def compute_metrics(actual, predicted):
     return rmse, r2, mae
 
 ###############################################################################
-# 12) STREAMLIT DASHBOARD
+# 13) STREAMLIT DASHBOARD WITH COMPARISON & METRICS
 ###############################################################################
 def run_streamlit():
     st.title("Biodegradation Dashboard - Compare Multiple Microorganisms (with Metrics)")
@@ -446,7 +484,7 @@ def run_streamlit():
         "evaluation metrics (RMSE, R², MAE) to gauge model performance."
     )
 
-    # 1) Load & Clean
+    # 1) Load and clean the data
     try:
         df = load_and_clean("experimental_data.csv")
         st.success("CSV loaded & cleaned!")
@@ -454,24 +492,23 @@ def run_streamlit():
         st.error(f"Error loading CSV: {e}")
         return
 
-    # 2) Pick a plastic from those with valid data
+    # 2) Select a plastic with sufficient data
     plastics = gather_plastics_with_valid_micros(df, threshold=2)
     if not plastics:
         st.warning("No valid plastics found (≥2 data points).")
         return
     plastic_choice = st.selectbox("Select Plastic", plastics, key="plastic_select")
 
-    # 3) Number of microorganisms to compare
+    # 3) Choose the number of microorganisms to compare (1-5)
     num_micro = st.number_input("Number of Microorganisms to Compare (1-5)", min_value=1, max_value=5, value=1, step=1, key="num_micro")
 
-    # 4) Build list of microorganisms & parameters
+    # 4) For each microorganism, get selection and environmental parameters
     micro_params = []
     micros_options = gather_micros_options(df, plastic_choice, threshold=2)
     if micros_options["Best Biodegradation (Highest avg)"].empty:
         st.warning(f"No microorganisms with ≥2 data points for {plastic_choice}.")
         return
     all_micros = micros_options["Alphabetical"]["microorganism"].tolist()
-
     for i in range(int(num_micro)):
         st.markdown(f"### Microorganism {i+1} Settings")
         micro = st.selectbox(f"Select Microorganism {i+1}", all_micros, key=f"micro_{i}")
@@ -489,14 +526,14 @@ def run_streamlit():
             "t_pH": t_pH
         })
 
-    # 5) Days to predict
+    # 5) Days to predict (common for all microorganisms)
     user_day = st.number_input("Days to Predict", min_value=1.0, value=30.0, step=1.0, key="user_day")
 
-    # 6) Fit fallback curves for each microorganism
+    # 6) Build fallback curves for each microorganism
     micro_results = []
     for i, params in enumerate(micro_params):
         sub = df[(df["plastic_type"] == plastic_choice) & (df["microorganism"] == params["micro"])]
-        # Filter by T/pH if not using standard conditions
+        # Apply T/pH filtering if not using standard conditions
         if not params["use_std"]:
             temp_mask = sub["temperature"].between(params["t_temp"] - 5, params["t_temp"] + 5)
             pH_mask = sub["pH"].between(params["t_pH"] - 1, params["t_pH"] + 1)
@@ -504,56 +541,57 @@ def run_streamlit():
             if len(sub_filtered) >= 2:
                 sub = sub_filtered
             else:
-                st.warning(f"Microorganism {i+1}: Not enough data after T/pH filter => using full subset.")
+                st.warning(f"Microorganism {i+1}: Not enough data after T/pH filter; using full subset.")
         if len(sub) < 2:
             st.error(f"Microorganism {i+1}: Not enough data (<2). Skipping.")
             micro_results.append(None)
             continue
 
+        # Fit the best fallback model using the fallback chain
         fallback_func, param_count, used_model, err = fit_auto_model(sub, user_day)
         if err:
             st.error(f"Microorganism {i+1} fitting error: {err}")
             micro_results.append(None)
             continue
 
-        # Evaluate fallback curve over a range
+        # Evaluate fallback curve over a range for plotting and metric computation
         sub_sorted = sub.sort_values("days")
         max_day_val = max(sub_sorted["days"].max(), user_day, 60)
         t_range = np.linspace(0, max_day_val, 100)
         degrade_fallback = fallback_func(t_range)
-        degrade_fallback[0] = 0  # Force start at 0 degrade
+        degrade_fallback[0] = 0  # Force start at 0%
         fallback_pred = fallback_func([user_day])[0]
 
-        # Store the fallback function so we can compute metrics
+        # Store all relevant results, including the fallback function (for metrics)
         micro_results.append({
             "index": i,
             "micro": params["micro"],
             "used_model": used_model,
-            "fallback_func": fallback_func,  # <-- store function for metrics
+            "fallback_func": fallback_func,  # Saved for computing evaluation metrics later
             "t_range": t_range,
             "degrade_fallback": degrade_fallback,
             "fallback_pred": fallback_pred,
             "subset": sub
         })
 
+    # Remove any None results
     micro_results = [mr for mr in micro_results if mr is not None]
     if not micro_results:
         st.error("No valid microorganisms after filtering. Exiting.")
         return
 
-    # 7) Show each fallback curve, compute & display metrics
+    # 7) For each microorganism, plot the fallback curve and compute evaluation metrics
     for mr in micro_results:
         idx = mr["index"]
         st.markdown(f"#### Microorganism {idx+1}: {mr['micro']} - Fallback Curve")
-
-        # 7a) Compute metrics on the fallback curve
         sub_s = mr["subset"].sort_values("days")
         x_vals = sub_s["days"].values
         y_actual = sub_s["degradation_rate"].values
-        y_predicted = mr["fallback_func"](x_vals)  # Key fix: we stored fallback_func
+        # Use the stored fallback function to compute predictions for evaluation metrics
+        y_predicted = mr["fallback_func"](x_vals)
         rmse, r2, mae = compute_metrics(y_actual, y_predicted)
 
-        # 7b) Plot the fallback curve
+        # Plot experimental data (scatter) and fallback curve (continuous line)
         fig_fallback = px.scatter(
             x=sub_s["days"],
             y=sub_s["degradation_rate"],
@@ -577,17 +615,16 @@ def run_streamlit():
         )
         st.plotly_chart(fig_fallback, key=f"fallback_chart_{idx}")
 
-        # 7c) Display fallback metrics
+        # Display evaluation metrics for the fallback model
         st.write(
-            f"**Fallback Metrics for {mr['micro']}:** "
-            f"RMSE = {rmse:.2f}, R² = {r2:.2f}, MAE = {mae:.2f}"
+            f"**Fallback Metrics for {mr['micro']}:** RMSE = {rmse:.2f}, R² = {r2:.2f}, MAE = {mae:.2f}"
         )
 
-        # 7d) Optional log fit
+        # 7d) Optional: Fit and display a log-fit curve for this microorganism
         do_log = st.checkbox(f"Fit a log equation for Micro {idx+1}?", key=f"log_{idx}")
         if do_log:
             log_func, log_err = fit_log_to_fallback(
-                lambda t: np.interp(t, mr["t_range"], mr["degrade_fallback"]), 
+                lambda t: np.interp(t, mr["t_range"], mr["degrade_fallback"]),
                 mr["t_range"][-1]
             )
             if log_err:
@@ -596,11 +633,10 @@ def run_streamlit():
                 degrade_log = log_func(mr["t_range"])
                 degrade_log[0] = 0
                 log_pred = log_func([user_day])[0]
-
-                # Compute metrics for the log-fit
+                # Compute evaluation metrics for the log-fit curve
                 y_log_predicted = log_func(x_vals)
                 rmse_log, r2_log, mae_log = compute_metrics(y_actual, y_log_predicted)
-
+                
                 fig_log = px.scatter(
                     x=sub_s["days"],
                     y=sub_s["degradation_rate"],
@@ -616,6 +652,7 @@ def run_streamlit():
                     line=dict(dash="dash", color="red"),
                     name=f"{mr['used_model']} fallback"
                 )
+                # Add log-fit curve as a continuous line
                 fig_log.add_scatter(
                     x=mr["t_range"],
                     y=degrade_log,
@@ -631,13 +668,11 @@ def run_streamlit():
                     name=f"log => {log_pred:.2f}%"
                 )
                 st.plotly_chart(fig_log, key=f"log_chart_{idx}")
-
                 st.write(
-                    f"**Log-Fit Metrics for {mr['micro']}:** "
-                    f"RMSE = {rmse_log:.2f}, R² = {r2_log:.2f}, MAE = {mae_log:.2f}"
+                    f"**Log-Fit Metrics for {mr['micro']}:** RMSE = {rmse_log:.2f}, R² = {r2_log:.2f}, MAE = {mae_log:.2f}"
                 )
 
-    # 8) Final overlay graph: fallback or log
+    # 8) Final overlay graph: Compare all microorganisms together
     st.markdown("### Final Overlay Graph")
     use_log_overlay = st.checkbox("Use log-fit curves in the overlay instead of fallback curves?")
     fig_overlay = px.line()
@@ -650,9 +685,10 @@ def run_streamlit():
     best_micro = None
 
     for mr in micro_results:
+        # Choose whether to use fallback or log-fit curves for overlay based on user choice
         if use_log_overlay:
             log_func, log_err = fit_log_to_fallback(
-                lambda t: np.interp(t, mr["t_range"], mr["degrade_fallback"]), 
+                lambda t: np.interp(t, mr["t_range"], mr["degrade_fallback"]),
                 mr["t_range"][-1]
             )
             if log_err:
@@ -683,19 +719,18 @@ def run_streamlit():
             best_pred_val = pred_val
             best_micro = mr["micro"]
 
-    # Set overlay axes
+    # Set axes limits for the overlay graph
     max_x = max([mr["t_range"][-1] for mr in micro_results] + [user_day]) + 2
     fig_overlay.update_xaxes(range=[0, max_x])
     fig_overlay.update_yaxes(range=[0, 105])
     st.plotly_chart(fig_overlay, key="final_overlay_chart")
 
-    # 9) Summarize which microorganism is best
+    # 9) Display a summary of the best-performing microorganism
     if best_micro:
         st.markdown("### Which microorganism is best?")
         st.write(
-            f"At day={user_day:.1f}, **{best_micro}** achieves the highest predicted "
-            f"degradation of **{best_pred_val:.2f}%** among the compared microorganisms "
-            f"for plastic **{plastic_choice}**."
+            f"At day={user_day:.1f}, **{best_micro}** achieves the highest predicted degradation "
+            f"of **{best_pred_val:.2f}%** for plastic **{plastic_choice}** among the compared microorganisms."
         )
     else:
         st.write("No best microorganism determined.")
